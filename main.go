@@ -159,7 +159,10 @@ func handleDockerRequest(domain string, w dns.ResponseWriter, r *dns.Msg) {
 		}
 		containerName := name[:len(name)-len(domainSuffix)]
 
-		container, err := dockerInspectContainer(config[domain].Socket, containerName)
+		container, err := dockerInspectContainer(config[domain].Socket, strings.ToUpper(containerName))
+		if err != nil {
+			container, err = dockerInspectContainer(config[domain].Socket, strings.ToLower(containerName))
+		}
 		if err != nil && strings.Contains(containerName, ".") {
 			// we have something like "db.app", so let's try looking up a "app/db" container (linking!)
 			parts := strings.Split(containerName, ".")
