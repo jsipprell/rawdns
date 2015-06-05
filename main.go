@@ -1,4 +1,4 @@
-package main // import "github.com/tianon/rawdns"
+package main
 
 import (
 	"encoding/json"
@@ -215,6 +215,13 @@ func (sd *serviceDiscoveryHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 	fakearecs := make(map[string]string)
 	for _, q := range r.Question {
+		if rrs, err := CacheGetRR(q); err == nil && len(rrs) > 0 {
+			for _, rr := range rrs {
+				dnsAppend(q, m, rr, rr.Header().Name)
+				count++
+			}
+			continue
+		}
 		name := q.Name
 		qtype := q.Qtype
 
@@ -273,7 +280,9 @@ func (sd *serviceDiscoveryHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 						target += "."
 					}
 					if hostPort, err := strconv.ParseUint(host.Port, 10, 16); hostPort > 0 && err == nil {
-						dnsAppend(q, m, &dns.SRV{Port: uint16(hostPort), Target: target})
+						srv := &dns.SRV{Port: uint16(hostPort), Target: target}
+						dnsAppend(q, m, srv)
+						CachePutRRminTTL(2, srv)
 						count++
 					}
 				}
@@ -332,12 +341,22 @@ func handleDockerRequest(domain string, w dns.ResponseWriter, r *dns.Msg) {
 
 func handleMultiDockerRequest(domain string, w dns.ResponseWriter, r *dns.Msg,
 	getContainers func(string, ...string) (<-chan *dockerContainer, error)) {
+
+	var count int
 	m := new(dns.Msg)
 	m.SetReply(r)
 	defer w.WriteMsg(m)
 
 	domainSuffix := "." + dns.Fqdn(domain)
 	for _, q := range r.Question {
+		if rrs, err := CacheGetRR(q); err == nil && len(rrs) > 0 {
+			for _, rr := range rrs {
+				dnsAppend(q, m, rr, rr.Header().Name)
+				count++
+			}
+			continue
+		}
+
 		name := q.Name
 		qtype := q.Qtype
 
@@ -370,11 +389,14 @@ func handleMultiDockerRequest(domain string, w dns.ResponseWriter, r *dns.Msg,
 			}
 
 			if qtype == dns.TypeA || qtype == dns.TypeANY {
+				var a *dns.A
 				if container.PublicIpAddress != nil {
-					dnsAppend(q, m, &dns.A{A: container.PublicIpAddress})
+					a = &dns.A{A: container.PublicIpAddress}
 				} else {
-					dnsAppend(q, m, &dns.A{A: net.ParseIP(containerIp)})
+					a = &dns.A{A: net.ParseIP(containerIp)}
 				}
+				dnsAppend(q, m, a)
+				CachePutRRminTTL(2, a)
 			}
 			if len(container.NetworkSettings.Ports) > 0 {
 				portcfg := make([]string, 0, len(container.NetworkSettings.Ports))
@@ -410,7 +432,9 @@ func handleMultiDockerRequest(domain string, w dns.ResponseWriter, r *dns.Msg,
 										target += "."
 									}
 									if hostPort, err := strconv.ParseUint(host.Port, 10, 16); hostPort > 0 && err == nil {
-										dnsAppend(q, m, &dns.SRV{Port: uint16(hostPort), Target: target})
+										srv := &dns.SRV{Port: uint16(hostPort), Target: target}
+										dnsAppend(q, m, srv)
+										CachePutRRminTTL(2, srv)
 									}
 								}
 							}
@@ -418,7 +442,9 @@ func handleMultiDockerRequest(domain string, w dns.ResponseWriter, r *dns.Msg,
 					}
 				}
 				if len(portcfg) > 0 {
-					dnsAppend(q, m, &dns.TXT{Txt: portcfg})
+					txt := &dns.TXT{Txt: portcfg}
+					dnsAppend(q, m, txt)
+					CachePutRRminTTL(2, txt)
 				}
 			}
 		}
@@ -435,15 +461,20 @@ func handleStaticRequest(config DomainConfig, w dns.ResponseWriter, r *dns.Msg) 
 	for _, q := range r.Question {
 		for _, addr := range config.addrs {
 			if addr.To4() != nil { // "If ip is not an IPv4 address, To4 returns nil."
-				dnsAppend(q, m, &dns.A{A: addr})
+				a := &dns.A{A: addr}
+				dnsAppend(q, m, a)
+				CachePutRRminTTL(2, a)
 			} else {
-				dnsAppend(q, m, &dns.AAAA{AAAA: addr})
+				a := &dns.AAAA{AAAA: addr}
+				dnsAppend(q, m, a)
+				CachePutRRminTTL(2, a)
 			}
 		}
 
 		for _, cname := range config.cnames {
-			dnsAppend(q, m, &dns.CNAME{Target: cname})
-
+			cn := &dns.CNAME{Target: cname}
+			dnsAppend(q, m, cn)
+			CachePutRRminTTL(2, cn)
 			if r.RecursionDesired && len(config.Nameservers) > 0 {
 				recR := &dns.Msg{
 					MsgHdr: dns.MsgHdr{
@@ -453,18 +484,28 @@ func handleStaticRequest(config DomainConfig, w dns.ResponseWriter, r *dns.Msg) 
 						{Name: cname, Qtype: q.Qtype, Qclass: q.Qclass},
 					},
 				}
+				if rrs, err := CacheGetRR(recR.Question...); err == nil && len(rrs) > 0 {
+					for _, rr := range rrs {
+						dnsAppend(q, m, rr)
+					}
+					continue
+				}
 				recM := handleForwardingRaw(config.Nameservers, recR, w.RemoteAddr())
 				for _, rr := range recM.Answer {
 					dnsAppend(q, m, rr)
+					CachePutRR(rr)
 				}
 				for _, rr := range recM.Extra {
 					dnsAppend(q, m, rr)
+					CachePutRR(rr)
 				}
 			}
 		}
 
 		for _, txt := range config.txts {
-			dnsAppend(q, m, &dns.TXT{Txt: txt})
+			txt := &dns.TXT{Txt: txt}
+			dnsAppend(q, m, txt)
+			CachePutRRminTTL(2, txt)
 		}
 	}
 }
