@@ -1,13 +1,17 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -47,21 +51,125 @@ type serviceDiscoveryHandler struct {
 	domainSuffix string
 }
 
-var config Config
-var broadcastAddress string
+var (
+	config           Config
+	broadcastAddress string
+	tlsSettings      = struct {
+		Enabled        bool
+		CAFile         string
+		VerifyCA       bool
+		ClientCertFile string
+		ClientKeyFile  string
+	}{}
+
+	tlsConfig *tls.Config
+)
+
+func cleanPath(p string) string {
+	return filepath.Clean(p)
+}
+
+func isDir(p string) bool {
+	if fi, err := os.Stat(cleanPath(p)); err == nil {
+		return fi.IsDir()
+	}
+	return false
+}
+
+func isFile(p string) bool {
+	if fi, err := os.Stat(cleanPath(p)); err == nil {
+		return fi.Mode().IsRegular()
+	}
+	return false
+}
 
 func init() {
+	cafile := "~/.docker/ca.pem"
+	tlscert := "~/.docker/cert.pem"
+	tlskey := "~/.docker/cert.key"
+
 	broadcastAddress = os.Getenv("BROADCAST")
+	if certDir := os.Getenv("DOCKER_CERT_PATH"); certDir != "" && isDir(certDir) {
+		var try string
+
+		certDir = cleanPath(certDir)
+		if try = filepath.Join(certDir, filepath.Base(cafile)); isFile(try) {
+			cafile = try
+		}
+		if try = filepath.Join(certDir, "client.pem"); isFile(try) {
+			tlscert = try
+		} else if try = filepath.Join(certDir, filepath.Base(tlscert)); isFile(try) {
+			tlscert = try
+		}
+		if try = filepath.Join(certDir, "client-key.pem"); isFile(try) {
+			tlskey = try
+		} else if try = filepath.Join(certDir, filepath.Base(tlskey)); isFile(try) {
+			tlskey = try
+		}
+	}
+	flag.BoolVar(&tlsSettings.Enabled, "tls", false, "enable tls remote docker api")
+	flag.StringVar(&tlsSettings.CAFile, "tlscacert", cafile, "Use specific CA certificate")
+	flag.StringVar(&tlsSettings.ClientCertFile, "tlscert", tlscert, "Use specific TLS client certificate")
+	flag.StringVar(&tlsSettings.ClientKeyFile, "tlskey", tlskey, "Use specific TLS client key")
+	flag.BoolVar(&tlsSettings.VerifyCA, "tlsverify", false, "verify server certificate (implies -tls)")
+}
+
+func finalizeTLSConfig() []string {
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+	if tlsSettings.VerifyCA {
+		tlsSettings.Enabled = true
+	}
+	if tlsSettings.Enabled {
+		tlsConfig = &tls.Config{
+			Certificates: make([]tls.Certificate, 0, 1),
+			MinVersion:   tls.VersionTLS10,
+		}
+
+		if tlsSettings.VerifyCA {
+			if !isFile(tlsSettings.CAFile) {
+				log.Fatal("-tlsverify requires a valid CA certificate (see -tlscacert)")
+			}
+			certPool := x509.NewCertPool()
+			file, err := ioutil.ReadFile(tlsSettings.CAFile)
+			if err != nil {
+				log.Fatal(err)
+			}
+			certPool.AppendCertsFromPEM(file)
+			tlsConfig.RootCAs = certPool
+		} else {
+			tlsConfig.InsecureSkipVerify = true
+		}
+		if isFile(tlsSettings.ClientCertFile) {
+			if !isFile(tlsSettings.ClientKeyFile) {
+				log.Fatal("-tlscert requires a tls key file (see -tlskey)")
+			}
+			cert, err := tls.LoadX509KeyPair(tlsSettings.ClientCertFile, tlsSettings.ClientKeyFile)
+			if err != nil {
+				log.Fatal(err)
+			}
+			tlsConfig.Certificates = append(tlsConfig.Certificates, cert)
+		} else if isFile(tlsSettings.ClientKeyFile) {
+			log.Fatal("-tlskey requires a tls cert file (see -tlscert)")
+		}
+	}
+
+	if tlsConfig != nil {
+		log.Printf("TLS enabled: %+v", tlsConfig)
+	}
+	return flag.Args()
 }
 
 func main() {
 	dnssdRe := regexp.MustCompile(`^(_[a-z]+)\.\w+`)
 
 	log.Printf("rawdns v%s (%s on %s/%s; %s)\n", VERSION, runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.Compiler)
+	args := finalizeTLSConfig()
 
 	configFile := "example-config.json"
-	if len(os.Args) > 1 {
-		configFile = os.Args[1]
+	if len(args) > 0 {
+		configFile = args[0]
 	}
 	configData, err := ioutil.ReadFile(configFile)
 	if err != nil {
@@ -126,8 +234,16 @@ func main() {
 		log.Printf("listening on domain: %s\n", domain)
 	}
 
-	go serve("tcp", ":53")
-	go serve("udp", ":53")
+	udpListen := os.Getenv("UDP_LISTEN_ADDR")
+	if udpListen == "" {
+		udpListen = ":53"
+	}
+	tcpListen := os.Getenv("TCP_LISTEN_ADDR")
+	if tcpListen == "" {
+		tcpListen = udpListen
+	}
+	go serve("tcp", tcpListen)
+	go serve("udp", udpListen)
 
 	sig := make(chan os.Signal)
 	signal.Notify(sig, os.Interrupt, os.Kill)

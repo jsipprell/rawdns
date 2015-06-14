@@ -146,10 +146,14 @@ func dockerInspectContainer(dockerHost, containerName string) (*dockerContainer,
 }
 
 func httpClient(u *url.URL) *http.Client {
-	transport := &http.Transport{}
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
 	switch u.Scheme {
 	case "tcp":
+		if tlsConfig == nil {
 		u.Scheme = "http"
+		} else {
+			u.Scheme = "https"
+		}
 	case "unix":
 		path := u.Path
 		transport.Dial = func(proto, addr string) (net.Conn, error) {
