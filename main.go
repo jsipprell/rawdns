@@ -26,6 +26,7 @@ type Config map[string]DomainConfig // { "docker.": { ... }, ".": { ... } }
 
 type DomainConfig struct {
 	Type string `json:"type"` // "containers", "forwarding", "static"
+	Port int    `json:"port"` // "swarm.dns-sd"
 
 	// "type": "containers"
 	Socket string `json:"socket"` // "unix:///var/run/docker.sock"
@@ -191,6 +192,35 @@ func main() {
 			sd := &serviceDiscoveryHandler{Config: config[domain], Domain: domain, Suffix: m[1]}
 			sd.init()
 			dns.Handle(domain, sd)
+		case "swarm.dns-sd", "swarm":
+			var suffix, discoveryURL string
+			discovery := os.Getenv("SWARM_DISCOVERY")
+			if discovery == "" {
+				discovery = os.Getenv("SWARM_ENV_SWARM_DISCOVERY")
+			}
+			if discovery == "" {
+				log.Fatal("swarm.dns-sd (swarm service discovery) not supported unless linked to swarm container or SWARM_DISCOVERY env variable is set")
+			}
+			if strings.HasPrefix(discovery, "consul://") {
+				discoveryURL = "http://" + strings.TrimPrefix(discovery, "consul://")
+			} else if strings.HasPrefix(discovery, "tcp://") {
+				discoveryURL = "http://" + strings.TrimPrefix(discovery, "tcp://")
+			} else if strings.HasPrefix(discovery, "http://") || strings.HasPrefix(discovery, "https://") {
+				discoveryURL = discovery
+			} else {
+				log.Fatalf("swarm.dns-sd: %q is not a support swarm discovery url.", discovery)
+			}
+			isdnssd := strings.HasSuffix(config[domain].Type, ".dns-sd")
+			if isdnssd {
+				m := dnssdRe.FindStringSubmatch(domain)
+				if len(m) < 2 {
+					log.Fatalf("error: DNS-SD service domains must be in the form _tcp.<domain>, _udp.<domain> or similar")
+				}
+				suffix = m[1]
+			}
+			sd := &swarmServiceDiscovery{Config: config[domain], Domain: domain, Suffix: suffix, DiscoURL: discoveryURL}
+			sd.init(!isdnssd)
+			dns.Handle(domain, sd)
 		case "containers":
 			// TODO there must be a better way to pass "domain" along without an anonymous function AND copied variable
 			dCopy := domain
@@ -265,7 +295,7 @@ func serve(net, addr string) {
 
 func dnsAppend(q dns.Question, m *dns.Msg, rr dns.RR, names ...string) {
 	var hdr dns.RR_Header
-	var extra bool
+	var extra, answer bool
 
 	if len(names) > 0 {
 		name := names[0]
@@ -277,6 +307,8 @@ func dnsAppend(q dns.Question, m *dns.Msg, rr dns.RR, names ...string) {
 		hdr = dns.RR_Header{Name: q.Name, Class: q.Qclass, Ttl: 0}
 	}
 
+	answer = q.Qtype == dns.TypeANY
+
 	if rrS, ok := rr.(*dns.A); ok {
 		hdr.Rrtype = dns.TypeA
 		rrS.Hdr = hdr
@@ -286,6 +318,9 @@ func dnsAppend(q dns.Question, m *dns.Msg, rr dns.RR, names ...string) {
 	} else if rrS, ok := rr.(*dns.CNAME); ok {
 		hdr.Rrtype = dns.TypeCNAME
 		rrS.Hdr = hdr
+		if !answer {
+			answer = (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypePTR)
+		}
 	} else if rrS, ok := rr.(*dns.TXT); ok {
 		hdr.Rrtype = dns.TypeTXT
 		rrS.Hdr = hdr
@@ -297,7 +332,7 @@ func dnsAppend(q dns.Question, m *dns.Msg, rr dns.RR, names ...string) {
 		return
 	}
 
-	if !extra && (q.Qtype == dns.TypeANY || q.Qtype == rr.Header().Rrtype) {
+	if !extra && (answer || (q.Qtype == dns.TypeANY || q.Qtype == rr.Header().Rrtype)) {
 		m.Answer = append(m.Answer, rr)
 	} else {
 		m.Extra = append(m.Extra, rr)
