@@ -196,7 +196,11 @@ func main() {
 			var suffix, discoveryURL string
 			discovery := os.Getenv("SWARM_DISCOVERY")
 			if discovery == "" {
-				discovery = os.Getenv("SWARM_ENV_SWARM_DISCOVERY")
+				if discovery = os.Getenv("SWARM_ENV_SWARM_DISCOVERY"); discovery == "" {
+					if discovery = os.Getenv("CFG_ENV_IPADDRESS"); discovery != "" {
+						discovery = "consul://" + discovery + ":8500"
+					}
+				}
 			}
 			if discovery == "" {
 				log.Fatal("swarm.dns-sd (swarm service discovery) not supported unless linked to swarm container or SWARM_DISCOVERY env variable is set")
