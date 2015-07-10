@@ -28,6 +28,8 @@ type DomainConfig struct {
 	Type string `json:"type"` // "containers", "forwarding", "static"
 	Port int    `json:"port"` // "swarm.dns-sd"
 
+	// "type": "fail"
+	Code string `json:"code"` // "fail"
 	// "type": "containers"
 	Socket string `json:"socket"` // "unix:///var/run/docker.sock"
 
@@ -183,6 +185,19 @@ func main() {
 
 	for domain := range config {
 		switch config[domain].Type {
+		case "fail", "failed", "failing":
+			code := dns.RcodeServerFailure
+			s := config[domain].Code
+			if s != "" {
+				var ok bool
+				if code, ok = dns.StringToRcode[strings.ToUpper(s)]; !ok {
+					log.Fatalf("error: unknown rcode %q", strings.ToUpper(s))
+				}
+			}
+			dCopy := domain
+			dns.HandleFunc(dCopy, func(w dns.ResponseWriter, r *dns.Msg) {
+				handleFailure(dCopy, code, w, r)
+			})
 		case "dns-sd":
 			// DNS service discovery (aka _foobar-service._tcp.example.com)
 			m := dnssdRe.FindStringSubmatch(domain)
@@ -343,12 +358,14 @@ func dnsAppend(q dns.Question, m *dns.Msg, rr dns.RR, names ...string) {
 	}
 }
 
-func normalizeContainerName(strict bool, name string, suffixes ...string) string {
-	if strict {
+func normalizeContainerName(upcaseprefix bool, name string, suffixes ...string) string {
+	if upcaseprefix {
 		name = strings.ToUpper(name)
-		for i, s := range suffixes {
-			suffixes[i] = strings.ToLower(s)
-		}
+	} else {
+		name = strings.ToLower(name)
+	}
+	for i, s := range suffixes {
+		suffixes[i] = strings.ToLower(s)
 	}
 
 	suffixes = append(suffixes, name)
@@ -404,8 +421,31 @@ func (sd *serviceDiscoveryHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 		for container := range C {
 			var labelPort string
+			var pri, weight uint16
 
 			if lp, ok := container.Config.Labels[label]; ok {
+				if strings.ContainsAny(lp, ":") {
+					parts := strings.Split(lp, ":")
+					lp = parts[0]
+					if parts[1] != "" {
+						if iv, err := strconv.ParseUint(parts[1], 10, 16); err == nil {
+							if iv > 0 {
+								pri = uint16(iv)
+							} else {
+								pri = 1
+							}
+						}
+					}
+					if len(parts) > 2 && parts[2] != "" {
+						if iv, err := strconv.ParseUint(parts[2], 10, 16); err == nil {
+							if iv > 0 {
+								weight = uint16(iv)
+							} else {
+								weight = 1
+							}
+						}
+					}
+				}
 				labelPort = lp + "/" + strings.ToLower(sd.Suffix[1:])
 			} else {
 				continue
@@ -435,7 +475,7 @@ func (sd *serviceDiscoveryHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 						target += "."
 					}
 					if hostPort, err := strconv.ParseUint(host.Port, 10, 16); hostPort > 0 && err == nil {
-						srv := &dns.SRV{Port: uint16(hostPort), Target: target}
+						srv := &dns.SRV{Port: uint16(hostPort), Target: target, Priority: pri, Weight: weight}
 						dnsAppend(q, m, srv)
 						CachePutRRminTTL(2, srv)
 						count++
@@ -480,9 +520,9 @@ func handleDockerRequest(domain string, w dns.ResponseWriter, r *dns.Msg) {
 			}
 			return nil, fmt.Errorf("no containers matched expression %#v", name)
 		}
-		container, err := dockerInspectContainer(sock, normalizeContainerName(true, name, names...))
+		container, err := dockerInspectContainer(sock, normalizeContainerName(false, name, names...))
 		if err != nil {
-			container, err = dockerInspectContainer(sock, normalizeContainerName(false, name, names...))
+			container, err = dockerInspectContainer(sock, normalizeContainerName(true, name, names...))
 		}
 		if err != nil {
 			return nil, err

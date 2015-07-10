@@ -3,15 +3,25 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	_ "log"
+	"io"
+	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"sync"
 )
 
 type dockerPortMapping struct {
 	IpAddress string `json:"HostIp"`
 	Port      string `json:"HostPort"`
+}
+
+type dockerClient struct {
+	sync.Mutex
+
+	Transport *http.Transport
 }
 
 type dockerContainer struct {
@@ -44,9 +54,39 @@ type dockerContainer struct {
 	}
 }
 
+var (
+	commonClient = new(dockerClient)
+	dockerDebug  bool
+)
+
 type infoMap map[string]interface{}
 
+type cleanupDockerConnection struct {
+	m    sync.Mutex
+	conn io.ReadCloser
+}
+
+func init() {
+	if os.Getenv("DOCKER_DEBUG") != "" {
+		dockerDebug = true
+	}
+}
+
+func (c *cleanupDockerConnection) Close() error {
+	c.m.Lock()
+	defer c.m.Unlock()
+	rc := c.conn
+	c.conn = nil
+	if rc != nil {
+		io.Copy(ioutil.Discard, rc)
+		return rc.Close()
+	}
+	return nil
+}
+
 func dockerInspectContainers(dockerHost string, filters map[string][]string) (<-chan *dockerContainer, error) {
+	cleanup := new(cleanupDockerConnection)
+
 	u, err := url.Parse(dockerHost)
 	if err != nil {
 		return nil, fmt.Errorf("failed parsing URL '%s': %v", dockerHost, err)
@@ -54,19 +94,30 @@ func dockerInspectContainers(dockerHost string, filters map[string][]string) (<-
 	client := httpClient(u)
 
 	params := make(url.Values)
-	b, err := json.Marshal(filters)
-	if err == nil && len(b) > 0 {
-		params.Set("filters", string(b))
-	}
 	u.Path = "/v1.18/containers/json"
-	u.RawQuery = params.Encode()
+	if len(filters) > 0 {
+		b, err := json.Marshal(filters)
+		if err != nil {
+			return nil, err
+		}
 
-	//log.Printf("URL = %#v", u)
+		params.Set("filters", string(b))
+		u.RawQuery = params.Encode()
+	}
+
+	if dockerDebug {
+		log.Printf("URL = %#v", u)
+	}
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed creating request: %v", err)
 	}
 	resp, err := client.Do(req)
+	if resp != nil && resp.Body != nil {
+		cleanup.conn = resp.Body
+		defer cleanup.Close()
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed HTTP request: %v", err)
 	}
@@ -116,6 +167,7 @@ func dockerInspectContainers(dockerHost string, filters map[string][]string) (<-
 		}
 	}()
 
+	cleanup.conn = nil
 	return C, err
 }
 
@@ -146,22 +198,31 @@ func dockerInspectContainer(dockerHost, containerName string) (*dockerContainer,
 }
 
 func httpClient(u *url.URL) *http.Client {
-	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	var newTransport bool
+	commonClient.Lock()
+	defer commonClient.Unlock()
+	if commonClient.Transport == nil {
+		commonClient.Transport = &http.Transport{TLSClientConfig: tlsConfig}
+		newTransport = true
+	}
 	switch u.Scheme {
 	case "tcp":
 		if tlsConfig == nil {
-		u.Scheme = "http"
+			u.Scheme = "http"
 		} else {
 			u.Scheme = "https"
 		}
+
 	case "unix":
 		path := u.Path
-		transport.Dial = func(proto, addr string) (net.Conn, error) {
-			return net.Dial("unix", path)
+		if newTransport {
+			commonClient.Transport.Dial = func(proto, addr string) (net.Conn, error) {
+				return net.Dial("unix", path)
+			}
 		}
 		u.Scheme = "http"
 		u.Host = "unix-socket"
 		u.Path = ""
 	}
-	return &http.Client{Transport: transport}
+	return &http.Client{Transport: commonClient.Transport}
 }
