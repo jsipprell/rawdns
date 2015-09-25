@@ -249,6 +249,23 @@ func main() {
 		case "forwarding":
 			// TODO there must be a better way to pass "domain" along without an anonymous function AND copied variable
 			nameservers := config[domain].Nameservers
+
+			dns.HandleFunc(domain, func(w dns.ResponseWriter, r *dns.Msg) {
+				handleForwarding(nameservers, w, r)
+			})
+		case "passthrough", "passthru":
+			dnscfg, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+			if err != nil {
+				log.Fatalf("%q - cannot parse resolver config: %v", domain, err)
+			}
+			if len(dnscfg.Servers) == 0 {
+				log.Fatalf("%q - /etc/resolv.conf contains no servers", domain)
+			}
+
+			nameservers := make([]string, len(config[domain].Nameservers), len(config[domain].Nameservers)+len(dnscfg.Servers))
+			copy(nameservers, config[domain].Nameservers)
+
+			nameservers = append(nameservers, dnscfg.Servers...)
 			dns.HandleFunc(domain, func(w dns.ResponseWriter, r *dns.Msg) {
 				handleForwarding(nameservers, w, r)
 			})
