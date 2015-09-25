@@ -15,7 +15,15 @@ import (
 	"github.com/miekg/dns"
 )
 
-func handleForwardingRaw(nameservers []string, req *dns.Msg, remote net.Addr) *dns.Msg {
+const (
+	dnsClientRandomizeNameservers = dnsClientFlag(1 << iota)
+	dnsClientAuthoritative
+	dnsClientRecurse
+)
+
+type dnsClientFlag uint
+
+func handleForwardingRaw(nameservers []string, req *dns.Msg, remote net.Addr, flags dnsClientFlag) *dns.Msg {
 	if len(nameservers) == 0 {
 		log.Printf("no nameservers defined, can not forward\n")
 		m := new(dns.Msg)
@@ -32,12 +40,17 @@ func handleForwardingRaw(nameservers []string, req *dns.Msg, remote net.Addr) *d
 	}
 
 	var (
-		r   *dns.Msg
-		err error
-		try int
+		r    *dns.Msg
+		err  error
+		try  int
+		nsid int
 	)
-	// Use request Id for "random" nameserver selection.
-	nsid := int(req.Id) % len(nameservers)
+	if flags&dnsClientRandomizeNameservers != 0 {
+		// Use request Id for "random" nameserver selections
+		nsid = int(req.Id) % len(nameservers)
+	}
+	req.Authoritative = flags&dnsClientAuthoritative != 0
+	req.RecursionAvailable = flags&dnsClientRecurse != 0
 	dnsClient := &dns.Client{Net: "udp", ReadTimeout: 4 * time.Second, WriteTimeout: 4 * time.Second, SingleInflight: true}
 	if tcp {
 		dnsClient.Net = "tcp"
@@ -69,5 +82,9 @@ Redo:
 
 // ServeDNSForward forwards a request to a nameservers and returns the response.
 func handleForwarding(nameservers []string, w dns.ResponseWriter, req *dns.Msg) {
-	w.WriteMsg(handleForwardingRaw(nameservers, req, w.RemoteAddr()))
+	w.WriteMsg(handleForwardingRaw(nameservers, req, w.RemoteAddr(), dnsClientRandomizeNameservers|dnsClientRecurse))
+}
+
+func handlePassthru(nameservers []string, w dns.ResponseWriter, req *dns.Msg) {
+	w.WriteMsg(handleForwardingRaw(nameservers, req, w.RemoteAddr(), dnsClientRecurse))
 }

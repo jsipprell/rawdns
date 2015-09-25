@@ -267,7 +267,7 @@ func main() {
 
 			nameservers = append(nameservers, dnscfg.Servers...)
 			dns.HandleFunc(domain, func(w dns.ResponseWriter, r *dns.Msg) {
-				handleForwarding(nameservers, w, r)
+				handlePassthru(nameservers, w, r)
 			})
 		case "static":
 			cCopy := config[domain]
@@ -702,7 +702,7 @@ func handleStaticRequest(config DomainConfig, w dns.ResponseWriter, r *dns.Msg) 
 					}
 					continue
 				}
-				recM := handleForwardingRaw(config.Nameservers, recR, w.RemoteAddr())
+				recM := handleForwardingRaw(config.Nameservers, recR, w.RemoteAddr(), dnsClientRandomizeNameservers|dnsClientRecurse)
 				for _, rr := range recM.Answer {
 					dnsAppend(q, m, rr)
 					CachePutRR(rr)
